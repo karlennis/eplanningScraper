@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { createRequire } from 'module';
 const require = createRequire(
     import.meta.url);
@@ -8,6 +9,7 @@ const tough = require('tough-cookie');
 const axiosCookieJarSupport = require('axios-cookiejar-support').default;
 import fs from 'fs';
 import path from 'path';
+import s3Uploader from './s3-uploader.mjs';
 
 const jar = new tough.CookieJar();
 axiosCookieJarSupport(axios);
@@ -17,19 +19,80 @@ const client = axios.create({
     withCredentials: true,
 });
 
-const applicationId = process.argv[2];
+// Parse command line arguments
+const args = process.argv.slice(2);
+const applicationId = args.find(arg => !arg.startsWith('--'));
+let storageMode = 'local';
+const storageArg = args.find(arg => arg.startsWith('--storage='));
+if (storageArg) {
+    const parts = storageArg.split('=');
+    if (parts.length > 1 && parts[1]) {
+        storageMode = parts[1];
+    }
+}
+
 if (!applicationId) {
-    console.error('❌ Please provide an application ID as an argument.');
+    console.log(`
+📋 Usage: node scrape.mjs <APPLICATION_ID> [--storage=MODE]
+
+Storage Modes:
+  --storage=local     Save files locally only (default)
+  --storage=s3        Upload to S3 only (no local files)
+  --storage=both      Save locally AND upload to S3
+
+Examples:
+  node scrape.mjs 2461047                    # Local storage only
+  node scrape.mjs 2461047 --storage=s3       # S3 only
+  node scrape.mjs 2461047 --storage=both     # Local + S3
+
+Environment Variables (required for S3):
+  S3_BUCKET           Your S3 bucket name
+  S3_REGION           AWS region (default: us-east-1)
+  S3_PREFIX           S3 folder prefix (default: planning-docs)
+  AWS_ACCESS_KEY_ID   AWS access key
+  AWS_SECRET_ACCESS_KEY AWS secret key
+`);
     process.exit(1);
+}
+
+// Validate storage mode
+const validModes = ['local', 's3', 'both'];
+if (!validModes.includes(storageMode)) {
+    console.error(`❌ Invalid storage mode: ${storageMode}`);
+    console.error(`Valid modes: ${validModes.join(', ')}`);
+    process.exit(1);
+}
+
+// Override environment variables based on storage mode
+if (storageMode === 's3' || storageMode === 'both') {
+    process.env.S3_ENABLED = 'true';
+    process.env.KEEP_LOCAL_FILES = storageMode === 'both' ? 'true' : 'false';
+} else {
+    process.env.S3_ENABLED = 'false';
+    process.env.KEEP_LOCAL_FILES = 'true';
+}
+
+console.log(`🚀 Starting scraper for application ${applicationId}`);
+console.log(`📦 Storage mode: ${storageMode.toUpperCase()}`);
+
+// Validate S3 configuration if needed
+if (storageMode === 's3' || storageMode === 'both') {
+    if (!process.env.S3_BUCKET) {
+        console.error(`❌ S3_BUCKET environment variable is required for storage mode: ${storageMode}`);
+        console.error('Set it with: export S3_BUCKET=your-bucket-name');
+        process.exit(1);
+    }
 }
 
 const BASE_URL = `https://idocswebdpss.meathcoco.ie/iDocsWebDPSS`;
 
-// Create downloads folder
+// Create downloads folder (only if keeping local files or S3 is disabled)
 const downloadsFolder = `downloads_${applicationId}`;
-if (!fs.existsSync(downloadsFolder)) {
-    fs.mkdirSync(downloadsFolder);
-    console.log(`📁 Created folder: ${downloadsFolder}`);
+if (s3Uploader.shouldKeepLocalFiles() || !s3Uploader.isEnabled()) {
+    if (!fs.existsSync(downloadsFolder)) {
+        fs.mkdirSync(downloadsFolder);
+        console.log(`📁 Created folder: ${downloadsFolder}`);
+    }
 }
 
 async function downloadFile(url, filename, index, total) {
@@ -51,7 +114,6 @@ async function downloadFile(url, filename, index, total) {
 
         // Parse the ViewFiles page to find the iframe src with the actual PDF
         const $view = cheerio.load(viewResponse.data);
-
         let actualPdfUrl = null;
 
         // Look for iframe with PDF source
@@ -60,7 +122,6 @@ async function downloadFile(url, filename, index, total) {
             if (src && src.includes('.pdf')) {
                 // Convert relative path to full URL
                 if (src.startsWith('.\\files\\') || src.startsWith('./files/')) {
-                    // Remove the .\ or ./ prefix and build full URL
                     const cleanPath = src.replace(/^\.\\/, '').replace(/^\.\//, '');
                     actualPdfUrl = `${BASE_URL}/${cleanPath}`;
                 } else if (!src.startsWith('http')) {
@@ -101,7 +162,6 @@ async function downloadFile(url, filename, index, total) {
 
         // Clean the URL (remove PDF viewer parameters)
         actualPdfUrl = actualPdfUrl.split('#')[0];
-
         console.log(`📥 Accessing PDF URL: ${actualPdfUrl}`);
 
         // Get the ViewPdf page first to check if it's another layer
@@ -126,8 +186,6 @@ async function downloadFile(url, filename, index, total) {
             console.log(`🔄 PDF URL returned HTML, parsing for real PDF link...`);
 
             const $pdfPage = cheerio.load(pdfPageResponse.data);
-
-            // Look for iframe, embed, or object tags with PDF
             let realPdfUrl = null;
 
             $pdfPage('iframe, embed, object').each((_, el) => {
@@ -187,13 +245,13 @@ async function downloadFile(url, filename, index, total) {
 
         // Download the actual PDF file with proper binary handling
         const finalPdfResponse = await client.get(finalPdfUrl, {
-            responseType: 'arraybuffer', // Use arraybuffer for binary data
+            responseType: 'arraybuffer',
             timeout: 60000,
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                 'Accept': 'application/pdf,*/*',
                 'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'identity', // Disable compression
+                'Accept-Encoding': 'identity',
                 'Referer': actualPdfUrl,
                 'Connection': 'keep-alive'
             }
@@ -220,14 +278,36 @@ async function downloadFile(url, filename, index, total) {
             console.log(`📄 Binary response saved for analysis`);
         }
 
-        // Update filename to have .pdf extension instead of .djvu
+        // Process the filename
         const pdfFilename = filename.replace(/\.djvu$/, '.pdf');
-        const filePath = path.join(downloadsFolder, pdfFilename);
+        let s3Result = null;
 
-        // Write the binary data directly to file
-        fs.writeFileSync(filePath, responseData);
+        // Upload to S3 if enabled using the s3Uploader module
+        if (s3Uploader.isEnabled()) {
+            try {
+                s3Result = await s3Uploader.upload(responseData, pdfFilename, applicationId);
+                console.log(`☁️  S3 upload successful: ${pdfFilename}`);
+            } catch (s3Error) {
+                console.error(`⚠️  S3 upload failed, continuing with local storage: ${s3Error.message}`);
+            }
+        }
 
-        console.log(`✅ Downloaded: ${pdfFilename} (${responseData.length} bytes)`);
+        // Save locally if enabled or if S3 upload failed
+        if (s3Uploader.shouldKeepLocalFiles() || (!s3Uploader.isEnabled() || !s3Result)) {
+            const filePath = path.join(downloadsFolder, pdfFilename);
+            fs.writeFileSync(filePath, responseData);
+            console.log(`💾 Saved locally: ${pdfFilename} (${responseData.length} bytes)`);
+        }
+
+        // Summary message
+        if (s3Uploader.isEnabled() && s3Result && !s3Uploader.shouldKeepLocalFiles()) {
+            console.log(`✅ Uploaded to S3 only: ${pdfFilename} (${responseData.length} bytes)`);
+        } else if (s3Uploader.isEnabled() && s3Result && s3Uploader.shouldKeepLocalFiles()) {
+            console.log(`✅ Saved locally + S3: ${pdfFilename} (${responseData.length} bytes)`);
+        } else {
+            console.log(`✅ Saved locally: ${pdfFilename} (${responseData.length} bytes)`);
+        }
+
         return Promise.resolve();
 
     } catch (error) {
@@ -295,10 +375,19 @@ async function downloadAllDocuments(links) {
         }
     }
 
-    console.log(`\n📊 Download Summary:`);
+    console.log(`\n📊 Download Summary (${storageMode.toUpperCase()} mode):`);
     console.log(`✅ Successfully downloaded: ${successCount} files`);
     console.log(`❌ Failed downloads: ${failCount} files`);
-    console.log(`📁 Files saved to: ${downloadsFolder}`);
+
+    // Print S3 summary if enabled
+    if (s3Uploader.isEnabled()) {
+        s3Uploader.printSummary(applicationId);
+    }
+
+    // Print local summary if applicable
+    if (s3Uploader.shouldKeepLocalFiles() || !s3Uploader.isEnabled()) {
+        console.log(`📁 Files saved to: ${downloadsFolder}`);
+    }
 }
 
 async function acceptDisclaimerAndGetDocs(appId) {
